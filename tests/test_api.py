@@ -2525,3 +2525,382 @@ def test_inventory_allocation_non_finite_quantity_422():
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 422, token
+
+
+# ---------------------------------------------------------------------------
+# /receivable-writeoff：收款对发票核销试算
+# ---------------------------------------------------------------------------
+
+_RW_INVOICES = [
+    {"invoice_no": "INV-10", "due_date": "2026-02-01", "amount": "100.00"},
+    {"invoice_no": "INV-1", "due_date": "2026-02-01", "amount": "30.00"},
+    {"invoice_no": "INV-2", "due_date": "2026-01-10", "amount": "50.25"},
+]
+
+
+def _rw_payload(events, invoices=_RW_INVOICES):
+    return {"invoices": invoices, "events": events}
+
+
+def test_receivable_writeoff_basic_split_and_totals():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [
+                {"type": "payment", "event_id": "E1", "amount": "60.25"},
+                {"type": "payment", "event_id": "E2", "amount": "70.00"},
+            ]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # 发票按 (到期日, 发票号)：INV-2(01-10) -> INV-1(02-01) -> INV-10(02-01)
+    assert [inv["invoice_no"] for inv in body["invoices"]] == [
+        "INV-2",
+        "INV-1",
+        "INV-10",
+    ]
+    # E1：INV-2 50.25 + INV-1 10.00；E2：INV-1 20.00 + INV-10 50.00
+    assert body["payments"] == [
+        {
+            "event_id": "E1",
+            "amount": 60.25,
+            "reversed": False,
+            "lines": [
+                {"invoice_no": "INV-2", "due_date": "2026-01-10", "amount": 50.25},
+                {"invoice_no": "INV-1", "due_date": "2026-02-01", "amount": 10.0},
+            ],
+        },
+        {
+            "event_id": "E2",
+            "amount": 70,
+            "reversed": False,
+            "lines": [
+                {"invoice_no": "INV-1", "due_date": "2026-02-01", "amount": 20.0},
+                {"invoice_no": "INV-10", "due_date": "2026-02-01", "amount": 50.0},
+            ],
+        },
+    ]
+    outstanding = {row["invoice_no"]: row["outstanding"] for row in body["invoices"]}
+    assert outstanding == {"INV-2": 0, "INV-1": 0, "INV-10": 50.0}
+    assert body["total_receivable"] == 180.25
+    assert body["total_outstanding"] == 50.0
+    assert body["total_applied"] == 130.25
+
+
+def test_receivable_writeoff_reversal_frees_capacity_without_reallocating():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [
+                {"type": "payment", "event_id": "E1", "amount": "180.25"},
+                {"type": "reversal", "event_id": "R1", "target_event_id": "E1"},
+                {"type": "payment", "event_id": "E2", "amount": "40.00"},
+            ]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    by_id = {p["event_id"]: p for p in body["payments"]}
+    # 被撤回的收款保留原始核销行并标记 reversed
+    assert by_id["E1"]["reversed"] is True
+    assert [(l["invoice_no"], l["amount"]) for l in by_id["E1"]["lines"]] == [
+        ("INV-2", 50.25),
+        ("INV-1", 30.0),
+        ("INV-10", 100.0),
+    ]
+    # E2 在释放出的额度上按顺序重新核销，只触及 INV-2
+    assert [(l["invoice_no"], l["amount"]) for l in by_id["E2"]["lines"]] == [
+        ("INV-2", 40.0)
+    ]
+    outstanding = {row["invoice_no"]: row["outstanding"] for row in body["invoices"]}
+    assert outstanding == {"INV-2": 10.25, "INV-1": 30.0, "INV-10": 100.0}
+    assert body["total_applied"] == 40.0
+
+
+def test_receivable_writeoff_identical_replays_count_once():
+    events = [
+        {"type": "payment", "event_id": "E1", "amount": "10.00"},
+        {"type": "payment", "event_id": "E1", "amount": "10.00"},
+        {"type": "reversal", "event_id": "R1", "target_event_id": "E1"},
+        {"type": "reversal", "event_id": "R1", "target_event_id": "E1"},
+    ]
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            events,
+            invoices=[{"invoice_no": "A", "due_date": "2026-01-01", "amount": 100}],
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [p["event_id"] for p in body["payments"]] == ["E1"]
+    assert body["payments"][0]["reversed"] is True
+    assert body["total_applied"] == 0
+    assert body["invoices"][0]["outstanding"] == 100
+
+
+def test_receivable_writeoff_conflicting_replay_409():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [
+                {"type": "payment", "event_id": "E1", "amount": "10.00"},
+                {"type": "payment", "event_id": "E1", "amount": "11.00"},
+            ]
+        ),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "conflicting_replay",
+        "event_index": 1,
+        "event_id": "E1",
+    }
+    assert "payments" not in resp.json()
+
+
+def test_receivable_writeoff_payment_replayed_as_reversal_409():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [
+                {"type": "payment", "event_id": "E1", "amount": "10.00"},
+                {"type": "reversal", "event_id": "E1", "target_event_id": "E1"},
+            ]
+        ),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "conflicting_replay"
+
+
+def test_receivable_writeoff_reversal_target_missing_409():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [{"type": "reversal", "event_id": "R1", "target_event_id": "GHOST"}]
+        ),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "reversal_target_missing",
+        "event_index": 0,
+        "event_id": "R1",
+        "target_event_id": "GHOST",
+    }
+
+
+def test_receivable_writeoff_double_reversal_409():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [
+                {"type": "payment", "event_id": "E1", "amount": "10.00"},
+                {"type": "reversal", "event_id": "R1", "target_event_id": "E1"},
+                {"type": "reversal", "event_id": "R2", "target_event_id": "E1"},
+            ]
+        ),
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["error"] == "reversal_target_already_reversed"
+    assert detail["event_index"] == 2
+    assert detail["target_event_id"] == "E1"
+
+
+def test_receivable_writeoff_payment_exceeds_outstanding_409():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [{"type": "payment", "event_id": "E1", "amount": "180.26"}]
+        ),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "payment_exceeds_outstanding",
+        "event_index": 0,
+        "event_id": "E1",
+        "payment_amount": 180.26,
+        "total_outstanding": 180.25,
+    }
+    assert "payments" not in resp.json()
+
+
+def test_receivable_writeoff_exact_outstanding_allowed():
+    resp = client.post(
+        "/receivable-writeoff",
+        json=_rw_payload(
+            [{"type": "payment", "event_id": "E1", "amount": "180.25"}]
+        ),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_outstanding"] == 0
+    assert body["total_applied"] == 180.25
+
+
+def test_receivable_writeoff_amount_validation_422():
+    base_invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "amount": "100.00"}
+    ]
+    for bad in (0, -1, "0", "-0.01", "1.999", "0.001", "abc", True):
+        payload = _rw_payload(
+            [{"type": "payment", "event_id": "E1", "amount": bad}],
+            invoices=base_invoices,
+        )
+        resp = client.post("/receivable-writeoff", json=payload)
+        assert resp.status_code == 422, bad
+
+    # 应收金额同样必须为正且至多两位小数
+    for bad_amount in (0, "-1", "1.234"):
+        resp = client.post(
+            "/receivable-writeoff",
+            json={
+                "invoices": [
+                    {"invoice_no": "A", "due_date": "2026-01-01", "amount": bad_amount}
+                ],
+                "events": [
+                    {"type": "payment", "event_id": "E1", "amount": "1.00"}
+                ],
+            },
+        )
+        assert resp.status_code == 422, bad_amount
+
+
+def test_receivable_writeoff_numeric_inputs_supported_and_exact():
+    # JSON 数字（浮点）输入也按分精确：0.1+0.2 类不产生误差
+    resp = client.post(
+        "/receivable-writeoff",
+        json={
+            "invoices": [
+                {"invoice_no": "A", "due_date": "2026-01-01", "amount": 0.3}
+            ],
+            "events": [
+                {"type": "payment", "event_id": "E1", "amount": 0.1},
+                {"type": "payment", "event_id": "E2", "amount": 0.2},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_applied"] == 0.3
+    assert body["total_outstanding"] == 0
+    assert [p["lines"][0]["amount"] for p in body["payments"]] == [0.1, 0.2]
+
+
+def test_receivable_writeoff_non_finite_amount_422():
+    for token in ("NaN", "Infinity", "-Infinity", "1e9999"):
+        raw = (
+            '{"invoices": [{"invoice_no": "A", "due_date": "2026-01-01", '
+            '"amount": 100}], "events": [{"type": "payment", "event_id": "E1", '
+            '"amount": ' + token + '}]}'
+        )
+        resp = client.post(
+            "/receivable-writeoff",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422, token
+
+
+def test_receivable_writeoff_structure_validation_422():
+    good_invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "amount": "100.00"}
+    ]
+
+    # 缺少 invoices / events
+    assert client.post("/receivable-writeoff", json={}).status_code == 422
+    # 空列表
+    assert (
+        client.post(
+            "/receivable-writeoff", json={"invoices": [], "events": []}
+        ).status_code
+        == 422
+    )
+    # 发票号重复
+    assert (
+        client.post(
+            "/receivable-writeoff",
+            json={
+                "invoices": [
+                    {"invoice_no": "A", "due_date": "2026-01-01", "amount": 1},
+                    {"invoice_no": "A", "due_date": "2026-02-01", "amount": 1},
+                ],
+                "events": [
+                    {"type": "payment", "event_id": "E1", "amount": "1.00"}
+                ],
+            },
+        ).status_code
+        == 422
+    )
+    # 到期日格式错误 / 非法日期
+    for bad_date in ("2026/01/01", "01-01-2026", "2026-1-1", "2026-02-30"):
+        assert (
+            client.post(
+                "/receivable-writeoff",
+                json={
+                    "invoices": [
+                        {"invoice_no": "A", "due_date": bad_date, "amount": 1}
+                    ],
+                    "events": [
+                        {"type": "payment", "event_id": "E1", "amount": "1.00"}
+                    ],
+                },
+            ).status_code
+            == 422
+        ), bad_date
+    # 空白发票号 / 事件号 / 撤回目标
+    for payload in (
+        {
+            "invoices": [
+                {"invoice_no": "   ", "due_date": "2026-01-01", "amount": 1}
+            ],
+            "events": [{"type": "payment", "event_id": "E1", "amount": "1.00"}],
+        },
+        {
+            "invoices": good_invoices,
+            "events": [{"type": "payment", "event_id": "  ", "amount": "1.00"}],
+        },
+        {
+            "invoices": good_invoices,
+            "events": [
+                {"type": "reversal", "event_id": "R1", "target_event_id": "  "}
+            ],
+        },
+    ):
+        assert (
+            client.post("/receivable-writeoff", json=payload).status_code == 422
+        ), payload
+    # 未知事件类型
+    assert (
+        client.post(
+            "/receivable-writeoff",
+            json={
+                "invoices": good_invoices,
+                "events": [
+                    {"type": "refund", "event_id": "E1", "amount": "1.00"}
+                ],
+            },
+        ).status_code
+        == 422
+    )
+    # 收款事件缺少 amount、撤回事件缺少 target_event_id
+    assert (
+        client.post(
+            "/receivable-writeoff",
+            json={
+                "invoices": good_invoices,
+                "events": [{"type": "payment", "event_id": "E1"}],
+            },
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/receivable-writeoff",
+            json={
+                "invoices": good_invoices,
+                "events": [{"type": "reversal", "event_id": "R1"}],
+            },
+        ).status_code
+        == 422
+    )

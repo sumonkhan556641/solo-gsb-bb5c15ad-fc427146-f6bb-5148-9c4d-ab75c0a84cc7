@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -609,6 +609,196 @@ class AllocateInventoryResponse(BaseModel):
     total_allocated: int | float = Field(..., description="总分配量")
 
     @field_validator("total_allocated", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+# ---------------------------------------------------------------------------
+# 收款对发票核销试算
+# ---------------------------------------------------------------------------
+
+CENTS = Decimal("0.01")
+
+
+def _parse_money(v: object) -> Decimal:
+    """金额入参校验：拒绝 bool；转为 Decimal，须为有限正数且至多两位小数。"""
+    if isinstance(v, bool):
+        raise ValueError("amount must be a number, not a boolean")
+    if isinstance(v, Decimal):
+        dec = v
+    else:
+        try:
+            # 数字经 str() 转 Decimal，避免 0.1+0.2 类二进制浮点误差
+            dec = Decimal(str(v))
+        except Exception:
+            raise ValueError(
+                "amount must be a number or a decimal string"
+            ) from None
+    if not dec.is_finite():
+        raise ValueError("amount must be a finite number")
+    if dec <= 0:
+        raise ValueError("amount must be greater than 0")
+    if dec.as_tuple().exponent < -2:
+        raise ValueError("amount may have at most 2 decimal places")
+    return dec
+
+
+class ReceivableInvoiceIn(BaseModel):
+    invoice_no: str = Field(..., min_length=1, description="发票号，非空，请求内唯一")
+    due_date: str = Field(..., description="到期日，严格 YYYY-MM-DD（ISO 8601）")
+    amount: Decimal = Field(
+        ..., description="应收金额，必须为正数，至多两位小数；整数或十进制"
+    )
+
+    @field_validator("invoice_no")
+    @classmethod
+    def _strip_invoice_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("invoice_no must not be empty or whitespace")
+        return v
+
+    @field_validator("amount")
+    @classmethod
+    def _validate_amount(cls, v: Decimal) -> Decimal:
+        return _parse_money(v)
+
+    @field_validator("due_date")
+    @classmethod
+    def _strict_date(cls, v: str) -> str:
+        try:
+            parsed = date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(
+                f"invalid due_date {v!r}: expected YYYY-MM-DD"
+            ) from None
+        # date.fromisoformat 在新版本会接受部分宽松写法，严格只允许 YYYY-MM-DD
+        if parsed.isoformat() != v:
+            raise ValueError(f"invalid due_date {v!r}: expected YYYY-MM-DD")
+        return v
+
+
+class PaymentEventIn(BaseModel):
+    """收款事件：携带正金额（至多两位小数）。"""
+
+    type: Literal["payment"] = Field(..., description="事件类型：payment（收款）")
+    event_id: str = Field(..., min_length=1, description="事件号，非空；重放按其去重")
+    amount: Decimal = Field(
+        ..., description="收款金额，必须为正数，至多两位小数；整数或十进制"
+    )
+
+    @field_validator("event_id")
+    @classmethod
+    def _strip_event_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("event_id must not be empty or whitespace")
+        return v
+
+    @field_validator("amount")
+    @classmethod
+    def _validate_amount(cls, v: Decimal) -> Decimal:
+        return _parse_money(v)
+
+
+class ReversalEventIn(BaseModel):
+    """撤回事件：引用先前某笔收款的事件号。"""
+
+    type: Literal["reversal"] = Field(
+        ..., description="事件类型：reversal（撤回先前收款）"
+    )
+    event_id: str = Field(..., min_length=1, description="事件号，非空；重放按其去重")
+    target_event_id: str = Field(
+        ..., min_length=1, description="被撤回的先前收款事件号"
+    )
+
+    @field_validator("event_id", "target_event_id")
+    @classmethod
+    def _strip_event_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("event ids must not be empty or whitespace")
+        return v
+
+
+ReceivableEventIn = Annotated[
+    PaymentEventIn | ReversalEventIn,
+    Field(discriminator="type", description="收款或撤回事件，按数组顺序处理"),
+]
+
+
+class ReceivableTrialRequest(BaseModel):
+    invoices: list[ReceivableInvoiceIn] = Field(
+        ..., min_length=1, description="发票，至少 1 张；发票号不得重复"
+    )
+    events: list[ReceivableEventIn] = Field(
+        ..., min_length=1, description="按顺序处理的收款 / 撤回事件，至少 1 条"
+    )
+
+    @model_validator(mode="after")
+    def _unique_invoice_nos(self) -> "ReceivableTrialRequest":
+        invoice_nos = [inv.invoice_no.strip() for inv in self.invoices]
+        if len(set(invoice_nos)) != len(invoice_nos):
+            raise ValueError("invoice_no values must be unique")
+        return self
+
+
+class WriteOffLineOut(BaseModel):
+    invoice_no: str
+    due_date: str
+    amount: int | float = Field(..., description="核销金额（正数）")
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+class PaymentWriteOffOut(BaseModel):
+    event_id: str = Field(..., description="收款事件号")
+    amount: int | float = Field(..., description="收款原始金额")
+    reversed: bool = Field(
+        ..., description="该收款是否随后被撤回（撤回后其行仍保留以便对账）"
+    )
+    lines: list[WriteOffLineOut] = Field(
+        ..., description="按发票填补顺序（到期日、发票号）排列的核销明细"
+    )
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+class InvoiceOutstandingOut(BaseModel):
+    invoice_no: str
+    due_date: str
+    receivable: int | float = Field(..., description="应收金额")
+    outstanding: int | float = Field(..., description="试算结束时未结金额")
+
+    @field_validator("receivable", "outstanding", mode="before")
+    @classmethod
+    def _coerce(cls, v: object) -> object:
+        return _quantity_number(v) if isinstance(v, Decimal) else v
+
+
+class ReceivableTrialResponse(BaseModel):
+    payments: list[PaymentWriteOffOut] = Field(
+        ..., description="各有效收款（去重后首次出现）的核销明细，按首次出现顺序"
+    )
+    invoices: list[InvoiceOutstandingOut] = Field(
+        ..., description="各发票应收与未结金额，按到期日、发票号排序"
+    )
+    total_receivable: int | float = Field(..., description="全部发票应收总额")
+    total_outstanding: int | float = Field(..., description="全部发票未结总额")
+    total_applied: int | float = Field(
+        ..., description="净核销总额（应收 − 未结，撤回金额不计入）"
+    )
+
+    @field_validator(
+        "total_receivable", "total_outstanding", "total_applied", mode="before"
+    )
     @classmethod
     def _coerce(cls, v: object) -> object:
         return _quantity_number(v) if isinstance(v, Decimal) else v

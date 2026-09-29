@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import math
@@ -28,9 +29,13 @@ from .models import (
     HandoffLegOut,
     HandoffRouteRequest,
     HandoffRouteResponse,
+    InvoiceOutstandingOut,
     OrderAllocationOut,
     OverlapRequest,
     OverlapResponse,
+    PaymentWriteOffOut,
+    ReceivableTrialRequest,
+    ReceivableTrialResponse,
     RestViolationOut,
     RestViolationsRequest,
     RestViolationsResponse,
@@ -40,6 +45,14 @@ from .models import (
     StaffingGapOut,
     StaffingGapsRequest,
     StaffingGapsResponse,
+    WriteOffLineOut,
+)
+from .receivables import (
+    InvoiceInput,
+    PaymentEvent,
+    ReversalEvent,
+    TrialRejected,
+    run_trial,
 )
 from .scheduler import (
     common_free_slots,
@@ -67,6 +80,9 @@ app = FastAPI(
         "以及在 UTC 窗口内按步长网格枚举多名参与者共同空闲的预约槽，"
         "并对账同一员工变更前后两版日程在 UTC 窗口内的取消与新增区间，"
         "以及在多名员工的连续共同在岗期间规划消息交接的最早到达链。"
+        "此外支持商户按到期日、发票号顺序试算收款对发票的核销："
+        "收款可拆到多张发票，撤回仅释放目标收款原核销额度且不重新分配，"
+        "并处理事件重放去重与整批拒绝。"
     ),
 )
 
@@ -455,4 +471,87 @@ def inventory_allocation(req: AllocateInventoryRequest) -> AllocateInventoryResp
             for row in remaining_rows
         ],
         total_allocated=total_allocated,
+    )
+
+
+def _to_cents(value: Decimal) -> int:
+    """已通过模型校验的金额 Decimal（至多两位小数）转为整数分。"""
+    return int((value * 100).to_integral_value())
+
+
+def _cents_to_decimal(cents: int) -> Decimal:
+    return (Decimal(cents) / 100).quantize(Decimal("0.01"))
+
+
+@app.post(
+    "/receivable-writeoff",
+    response_model=ReceivableTrialResponse,
+    summary="试算收款对发票的核销（含撤回与重放去重）",
+)
+def receivable_writeoff(req: ReceivableTrialRequest) -> ReceivableTrialResponse:
+    # 金额在模型层已校验为正数且至多两位小数，这里统一转为整数分精确运算
+    invoices = [
+        InvoiceInput(
+            invoice_no=inv.invoice_no,
+            due_date=date.fromisoformat(inv.due_date),
+            receivable_cents=_to_cents(inv.amount),
+        )
+        for inv in req.invoices
+    ]
+    events: list[PaymentEvent | ReversalEvent] = [
+        PaymentEvent(event_id=ev.event_id, amount_cents=_to_cents(ev.amount))
+        if ev.type == "payment"
+        else ReversalEvent(
+            event_id=ev.event_id, target_event_id=ev.target_event_id
+        )
+        for ev in req.events
+    ]
+    try:
+        payments, outcomes, total_applied_cents = run_trial(invoices, events)
+    except TrialRejected as exc:
+        # 冲突重放 / 非法撤回 / 收款超额：整批拒绝（409），不返回部分试算
+        detail = exc.detail()
+        for money_field in ("payment_amount", "total_outstanding"):
+            if money_field in detail:
+                value = _cents_to_decimal(detail[money_field])
+                detail[money_field] = (
+                    int(value) if value == value.to_integral_value() else float(value)
+                )
+        return JSONResponse(status_code=409, content={"detail": detail})
+
+    total_receivable_cents = sum(
+        (inv.receivable_cents for inv in invoices), 0
+    )
+    total_outstanding_cents = sum(
+        (row.outstanding_cents for row in outcomes), 0
+    )
+    return ReceivableTrialResponse(
+        payments=[
+            PaymentWriteOffOut(
+                event_id=p.event_id,
+                amount=_cents_to_decimal(p.amount_cents),
+                reversed=p.reversed,
+                lines=[
+                    WriteOffLineOut(
+                        invoice_no=line.invoice_no,
+                        due_date=line.due_date.isoformat(),
+                        amount=_cents_to_decimal(line.amount_cents),
+                    )
+                    for line in p.lines
+                ],
+            )
+            for p in payments
+        ],
+        invoices=[
+            InvoiceOutstandingOut(
+                invoice_no=row.invoice_no,
+                due_date=row.due_date.isoformat(),
+                receivable=_cents_to_decimal(row.receivable_cents),
+                outstanding=_cents_to_decimal(row.outstanding_cents),
+            )
+            for row in outcomes
+        ],
+        total_receivable=_cents_to_decimal(total_receivable_cents),
+        total_outstanding=_cents_to_decimal(total_outstanding_cents),
+        total_applied=_cents_to_decimal(total_applied_cents),
     )
