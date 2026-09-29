@@ -2525,3 +2525,424 @@ def test_inventory_allocation_non_finite_quantity_422():
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 422, token
+
+
+# ---------------------------------------------------------------------------
+# /receipt-write-off：收款（含撤回）对发票的核销试算
+# ---------------------------------------------------------------------------
+
+_WO_INVOICES = [
+    {"invoice_no": "INV-010", "due_date": "2026-02-01", "receivable": 10},
+    {"invoice_no": "INV-002", "due_date": "2026-01-01", "receivable": 7},
+    {"invoice_no": "INV-001", "due_date": "2026-01-01", "receivable": 5},
+]
+
+
+def _wo(events, invoices=_WO_INVOICES):
+    return client.post(
+        "/receipt-write-off", json={"invoices": invoices, "events": events}
+    )
+
+
+def test_write_off_fills_by_due_date_then_invoice_no_and_splits():
+    resp = _wo([{"type": "receipt", "event_id": "R1", "amount": 20}])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["receipts"] == [
+        {
+            "event_id": "R1",
+            "amount": 20,
+            "lines": [
+                {"invoice_no": "INV-001", "due_date": "2026-01-01", "amount": 5},
+                {"invoice_no": "INV-002", "due_date": "2026-01-01", "amount": 7},
+                {"invoice_no": "INV-010", "due_date": "2026-02-01", "amount": 8},
+            ],
+        }
+    ]
+    # 未结表按 (到期日, 发票号) 排序
+    assert [
+        (inv["invoice_no"], inv["outstanding"]) for inv in body["invoices"]
+    ] == [
+        ("INV-001", 0),
+        ("INV-002", 0),
+        ("INV-010", 2),
+    ]
+    assert body["total_written_off"] == 20
+    # 原始应收金额原样返回
+    assert {inv["invoice_no"]: inv["receivable"] for inv in body["invoices"]} == {
+        "INV-001": 5,
+        "INV-002": 7,
+        "INV-010": 10,
+    }
+
+
+def test_write_off_multiple_receipts_share_outstanding_in_order():
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 12},
+            {"type": "receipt", "event_id": "R2", "amount": "8"},
+        ]
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [(l["invoice_no"], l["amount"]) for l in body["receipts"][0]["lines"]] == [
+        ("INV-001", 5),
+        ("INV-002", 7),
+    ]
+    assert [(l["invoice_no"], l["amount"]) for l in body["receipts"][1]["lines"]] == [
+        ("INV-010", 8)
+    ]
+    assert body["total_written_off"] == 20
+
+
+def test_write_off_exact_equal_receipt_settles_everything():
+    resp = _wo(
+        [{"type": "receipt", "event_id": "R1", "amount": "22.00"}],
+        invoices=[
+            {"invoice_no": "A", "due_date": "2026-01-01", "receivable": "2.50"},
+            {"invoice_no": "B", "due_date": "2026-02-01", "receivable": "19.50"},
+        ],
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert all(inv["outstanding"] == 0 for inv in body["invoices"])
+    assert body["total_written_off"] == 22.0
+
+
+def test_write_off_decimal_cents_serialized_as_number():
+    resp = _wo(
+        [{"type": "receipt", "event_id": "R1", "amount": "0.15"}],
+        invoices=[
+            {"invoice_no": "A", "due_date": "2026-01-01", "receivable": "0.10"},
+            {"invoice_no": "B", "due_date": "2026-02-01", "receivable": "0.20"},
+        ],
+    )
+    assert resp.status_code == 200
+    lines = resp.json()["receipts"][0]["lines"]
+    assert [(l["invoice_no"], l["amount"]) for l in lines] == [
+        ("A", 0.1),
+        ("B", 0.05),
+    ]
+
+
+def test_write_off_withdrawal_releases_only_target_for_later_receipt():
+    # R1 结清 A(10)；R2 核销 B(5)；撤回 R1 释放 A；R3 使用释放额度核销 A
+    invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10},
+        {"invoice_no": "B", "due_date": "2026-02-01", "receivable": 10},
+    ]
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 10},
+            {"type": "receipt", "event_id": "R2", "amount": 5},
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+            {"type": "receipt", "event_id": "R3", "amount": 10},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # 已撤回的 R1 不在有效收款明细中
+    assert [r["event_id"] for r in body["receipts"]] == ["R2", "R3"]
+    assert [(l["invoice_no"], l["amount"]) for l in body["receipts"][0]["lines"]] == [
+        ("B", 5)
+    ]
+    assert [(l["invoice_no"], l["amount"]) for l in body["receipts"][1]["lines"]] == [
+        ("A", 10)
+    ]
+    assert [(inv["invoice_no"], inv["outstanding"]) for inv in body["invoices"]] == [
+        ("A", 0),
+        ("B", 5),
+    ]
+    assert body["total_written_off"] == 15
+
+
+def test_write_off_withdrawal_of_split_receipt_restores_all_lines():
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 12},
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+        ]
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["receipts"] == []
+    assert [inv["outstanding"] for inv in body["invoices"]] == [5, 7, 10]
+    assert body["total_written_off"] == 0
+
+
+def test_write_off_identical_receipt_replay_applied_once():
+    invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10},
+    ]
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 8},
+            {"type": "receipt", "event_id": "R1", "amount": "8.00"},
+            {"type": "receipt", "event_id": "R2", "amount": 2},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [r["event_id"] for r in body["receipts"]] == ["R1", "R2"]
+    assert body["receipts"][0]["lines"] == [
+        {"invoice_no": "A", "due_date": "2026-01-01", "amount": 8}
+    ]
+    assert body["invoices"][0]["outstanding"] == 0
+
+
+def test_write_off_identical_reversal_replay_applied_once():
+    invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10},
+    ]
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 5},
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+            {"type": "receipt", "event_id": "R2", "amount": 5},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [r["event_id"] for r in body["receipts"]] == ["R2"]
+    assert body["invoices"][0]["outstanding"] == 5
+
+
+def test_write_off_different_replay_content_rejected_409():
+    invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10},
+    ]
+    # 金额不同
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 5},
+            {"type": "receipt", "event_id": "R1", "amount": 6},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "inconsistent_replay",
+        "event_id": "R1",
+    }
+    assert "receipts" not in resp.json()
+
+    # 同事件号类型互换（收款 vs 撤回）
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "E1", "amount": 5},
+            {"type": "reversal", "event_id": "E1", "reversal_of": "R9"},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["error"] == "inconsistent_replay"
+
+    # 撤回目标不同
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 1},
+            {"type": "receipt", "event_id": "R2", "amount": 1},
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R2"},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["event_id"] == "V1"
+
+
+def test_write_off_reversal_missing_target_rejected_409():
+    invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10},
+    ]
+    resp = _wo(
+        [{"type": "reversal", "event_id": "V1", "reversal_of": "R1"}],
+        invoices=invoices,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "reversal_target_invalid",
+        "event_id": "V1",
+        "referenced_event_id": "R1",
+        "reason": "not_found",
+    }
+
+    # 前向引用：目标收款事件出现在撤回之后
+    resp = _wo(
+        [
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+            {"type": "receipt", "event_id": "R1", "amount": 1},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "not_found"
+
+    # 撤回指向另一个撤回事件
+    resp = _wo(
+        [
+            {"type": "reversal", "event_id": "V1", "reversal_of": "V2"},
+            {"type": "reversal", "event_id": "V2", "reversal_of": "X"},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["event_id"] == "V1"
+
+
+def test_write_off_reversal_already_reversed_rejected_409():
+    invoices = [
+        {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10},
+    ]
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 1},
+            {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+            {"type": "reversal", "event_id": "V2", "reversal_of": "R1"},
+        ],
+        invoices=invoices,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "reversal_target_invalid",
+        "event_id": "V2",
+        "referenced_event_id": "R1",
+        "reason": "already_reversed",
+    }
+
+
+def test_write_off_receipt_exceeding_remaining_rejected_409_no_partial():
+    resp = _wo(
+        [{"type": "receipt", "event_id": "R1", "amount": "22.01"}],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "error": "receipt_exceeds_receivable",
+        "event_id": "R1",
+        "amount": 22.01,
+        "remaining_receivable": 22,
+        "shortfall": 0.01,
+    }
+    body = resp.json()
+    assert "receipts" not in body
+    assert "invoices" not in body
+
+    # 超额发生在后续收款（首笔已结清全部发票）
+    resp = _wo(
+        [
+            {"type": "receipt", "event_id": "R1", "amount": 22},
+            {"type": "receipt", "event_id": "R2", "amount": 0.01},
+        ],
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["event_id"] == "R2"
+
+
+def test_write_off_non_positive_or_more_than_two_decimals_422():
+    for bad_amount in (0, -1, "0", "-0.01", "0.001", "10.123", "abc"):
+        resp = _wo(
+            [{"type": "receipt", "event_id": "R1", "amount": bad_amount}],
+            invoices=[
+                {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10}
+            ],
+        )
+        assert resp.status_code == 422, bad_amount
+
+    for bad_receivable in (0, -5, "0.005", "1.999"):
+        resp = _wo(
+            [{"type": "receipt", "event_id": "R1", "amount": 1}],
+            invoices=[
+                {"invoice_no": "A", "due_date": "2026-01-01", "receivable": bad_receivable}
+            ],
+        )
+        assert resp.status_code == 422, bad_receivable
+
+
+def test_write_off_bad_date_and_duplicate_invoice_and_missing_fields_422():
+    for bad_date in ("2026/01/01", "01-01-2026", "2026-1-1", "20260101", "2026-02-30"):
+        resp = _wo(
+            [{"type": "receipt", "event_id": "R1", "amount": 1}],
+            invoices=[
+                {"invoice_no": "A", "due_date": bad_date, "receivable": 10}
+            ],
+        )
+        assert resp.status_code == 422, bad_date
+
+    # 发票号重复
+    resp = _wo(
+        [{"type": "receipt", "event_id": "R1", "amount": 1}],
+        invoices=[
+            {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10},
+            {"invoice_no": "A", "due_date": "2026-01-02", "receivable": 1},
+        ],
+    )
+    assert resp.status_code == 422
+
+    # 空事件号 / 空发票号 / 空白事件号
+    resp = _wo(
+        [{"type": "receipt", "event_id": "  ", "amount": 1}],
+        invoices=[
+            {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10}
+        ],
+    )
+    assert resp.status_code == 422
+
+    resp = _wo(
+        [{"type": "receipt", "event_id": "R1", "amount": 1}],
+        invoices=[
+            {"invoice_no": "   ", "due_date": "2026-01-01", "receivable": 10}
+        ],
+    )
+    assert resp.status_code == 422
+
+    # 撤回缺少 reversal_of
+    resp = _wo(
+        [{"type": "reversal", "event_id": "V1"}],
+        invoices=[
+            {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10}
+        ],
+    )
+    assert resp.status_code == 422
+
+
+def test_write_off_unknown_type_discriminator_422():
+    resp = _wo(
+        [{"type": "chargeback", "event_id": "X", "amount": 1}],
+        invoices=[
+            {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10}
+        ],
+    )
+    assert resp.status_code == 422
+
+
+def test_write_off_empty_lists_and_missing_body_422():
+    assert client.post("/receipt-write-off", json={"invoices": [], "events": []}).status_code == 422
+    assert client.post("/receipt-write-off", json={}).status_code == 422
+    assert client.post(
+        "/receipt-write-off",
+        json={
+            "invoices": [
+                {"invoice_no": "A", "due_date": "2026-01-01", "receivable": 10}
+            ],
+            "events": [],
+        },
+    ).status_code == 422
+
+
+def test_write_off_non_finite_amount_422():
+    for token in ("NaN", "Infinity", "-Infinity", "1e9999"):
+        raw = (
+            '{"invoices": [{"invoice_no": "A", "due_date": "2026-01-01", '
+            '"receivable": 10}], "events": [{"type": "receipt", '
+            '"event_id": "R1", "amount": ' + token + '}]}'
+        )
+        resp = client.post(
+            "/receipt-write-off",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422, token

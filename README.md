@@ -22,6 +22,16 @@ UTC 时间与决策原因。`POST /overlaps` 在此基础上为两个日程各�
 此外 `POST /inventory-allocation` 提供仓储 FEFO 批次分配：
 按失效日期（同日按批次号字典序）把订单数量拆分配到库存批次，
 全部订单足量满足才整批提交，库存不足时整批拒绝且不返回部分分配。
+`POST /receipt-write-off` 提供商户收款对发票的核销试算：
+收款按到期日（同日按发票号字典序）顺序填补未结金额、单笔可拆到多张发票，
+撤回只释放目标收款原先核销的金额而不重排其他收款，释放额度可供后续收款使用；
+相同事件号的重放按幂等处理（内容一致只计一次，内容不同整批拒绝），
+撤回不存在或已撤回的收款、以及收款超过剩余应收同样整批拒绝、不返回部分试算。
+
+> **本轮变动（v1.1.0）**：新增 `POST /receipt-write-off` 收款核销试算接口与
+> 纯逻辑模块 `app/receivables.py`（Decimal 按分精确运算、原子整批拒绝）；
+> 既有接口与行为保持不变。启动方式、健康检查与镜像构建期自检不变
+> （自检额外断言 `/receipt-write-off` 路由已注册）。
 
 ## 快速启动（单条命令）
 
@@ -36,7 +46,7 @@ docker compose up --build
 - 服务地址： http://localhost:8000
 - 交互式文档（Swagger UI）： http://localhost:8000/docs
 - 健康检查： http://localhost:8000/health
-- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`、`/inventory-allocation`
+- 接口（均为 POST，端口同上）： `/expand`、`/overlaps`、`/daily-occupancy`、`/staffing-gaps`、`/rest-violations`、`/common-free-slots`、`/schedule-changes`、`/handoff-route`、`/inventory-allocation`、`/receipt-write-off`
 
 ## 配置
 
@@ -765,6 +775,115 @@ docker compose up --build
 全部批次的可用量合计。输入校验失败（数量非正、批次号 / 订单号重复或为空、
 日期格式错误、列表为空等）统一返回 `422`，详见下节。
 
+### `POST /receipt-write-off`
+
+商户试算一批收款对发票的核销。输入发票（发票号、到期日、应收金额）以及**按顺序
+排列**的收款 / 撤回事件。处理规则：
+
+- **核销顺序**：发票按 `due_date` 从早到晚排序，**同日按 `invoice_no` Unicode
+  字典序**排序；每笔收款依次填补排好序发票的当前未结金额，**单笔收款可拆分核销
+  到多张发票**。
+- **撤回只释放原额度**：撤回按 `reversal_of` 找到目标收款，**只把该收款原先核销
+  的那些金额逐笔加回**；已处理的其他收款保持原样、**不重新分配**。释放出的额度
+  供**后续**收款使用。
+- **幂等重放**：`event_id` 相同代表同一事件重放——**内容完全一致只计一次**
+  （收款不再次核销，撤回不再次释放，直接跳过）；**内容不同则整批拒绝**
+  （金额不一致、撤回目标不一致、收款 / 撤回类型互换都算内容不同）。
+- **非法撤回整批拒绝**：撤回目标在该撤回之前不存在（事件号不存在、指向撤回事件、
+  指向尚未出现的后续事件、自引用），或该收款**已经被撤回**。
+- **超额收款整批拒绝**：收款金额**严格大于**处理当时的全部发票剩余应收合计
+  （恰好相等允许，发票恰好全部结清）。
+- 金额必须为**正数且至多两位小数**，全程以 `Decimal` **按分精确计算**；任何
+  上述业务冲突都返回 `409`，**不返回任何部分试算**。
+
+请求体：
+
+```json
+{
+  "invoices": [
+    {"invoice_no": "INV-003", "due_date": "2026-02-01", "receivable": "10.00"},
+    {"invoice_no": "INV-001", "due_date": "2026-01-01", "receivable": 5},
+    {"invoice_no": "INV-002", "due_date": "2026-01-01", "receivable": 7}
+  ],
+  "events": [
+    {"type": "receipt",  "event_id": "R1", "amount": "20.00"},
+    {"type": "receipt",  "event_id": "R1", "amount": "20.00"},
+    {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+    {"type": "receipt",  "event_id": "R2", "amount": "22.00"}
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `invoices` | object[] | 发票，至少 1 张；`invoice_no` 在请求内唯一、非空（去除首尾空白后） |
+| `invoices[].invoice_no` | string | 发票号（去除首尾空白后非空且唯一） |
+| `invoices[].due_date` | string | 到期日，严格 `YYYY-MM-DD`（ISO 8601） |
+| `invoices[].receivable` | number \| string | 应收金额，**正数且至多两位小数** |
+| `events` | object[] | 按顺序处理的事件，至少 1 个；以 `type` 区分收款 / 撤回 |
+| `events[].type` | string | `receipt`（收款）或 `reversal`（撤回） |
+| 收款 `events[].event_id` | string | 事件号，非空；**相同事件号视为同一事件的重放** |
+| 收款 `events[].amount` | number \| string | 收款金额，**正数且至多两位小数** |
+| 撤回 `events[].reversal_of` | string | 被撤回的**先前收款**事件号（去除首尾空白后非空） |
+
+响应 `200`（`receipts` 按事件处理顺序；`invoices` 按到期日、发票号排序）：
+
+```json
+{
+  "receipts": [
+    {
+      "event_id": "R2",
+      "amount": 22,
+      "lines": [
+        {"invoice_no": "INV-001", "due_date": "2026-01-01", "amount": 5},
+        {"invoice_no": "INV-002", "due_date": "2026-01-01", "amount": 7},
+        {"invoice_no": "INV-003", "due_date": "2026-02-01", "amount": 10}
+      ]
+    }
+  ],
+  "invoices": [
+    {"invoice_no": "INV-001", "due_date": "2026-01-01", "receivable": 5,  "outstanding": 0},
+    {"invoice_no": "INV-002", "due_date": "2026-01-01", "receivable": 7,  "outstanding": 0},
+    {"invoice_no": "INV-003", "due_date": "2026-02-01", "receivable": 10, "outstanding": 0}
+  ],
+  "total_written_off": 22
+}
+```
+
+上例中 `R1` 收款 20 后被 `V1` 撤回（其核销额全部释放，`R1` 不再出现在
+`receipts` 中），紧随其后的同内容 `R1` 重放只计一次（跳过）；`R2` 收款 22
+恰好结清三张发票（到期顺序 INV-001 / INV-002 同日，再 INV-003）。
+
+| 字段 | 说明 |
+| --- | --- |
+| `receipts[]` | 各**有效收款**（未被撤回）的核销明细，按事件处理顺序；同内容重放不重复输出 |
+| `receipts[].event_id` / `amount` | 收款事件号 / 收款原始金额；`lines` 各金额之和与其相等 |
+| `receipts[].lines[]` | 按到期日、发票号填补顺序排列的核销明细（可跨多张发票，金额为 0 不出现） |
+| `invoices[]` | 每张发票的未结情况，按到期日、发票号排序；含全部输入发票（即使未被核销） |
+| `invoices[].receivable` / `outstanding` | 原始应收金额 / 试算后未结金额 |
+| `total_written_off` | 有效收款的核销总额（等于各发票应收 − 未结之和） |
+
+业务冲突时返回 `409 Conflict`，响应体只含 `detail`，**不含任何核销结果**
+（整批原子拒绝）。三类错误：
+
+```json
+// 收款超过当时剩余应收合计
+{"detail": {"error": "receipt_exceeds_receivable", "event_id": "R1",
+            "amount": 22.01, "remaining_receivable": 22, "shortfall": 0.01}}
+
+// 撤回目标不存在 / 已撤回（reason: not_found / already_reversed）
+{"detail": {"error": "reversal_target_invalid", "event_id": "V2",
+            "referenced_event_id": "R1", "reason": "already_reversed"}}
+
+// 相同事件号内容不一致的重放
+{"detail": {"error": "inconsistent_replay", "event_id": "R1"}}
+```
+
+输入形状 / 取值校验失败（金额非正、超过两位小数、不是数字、`due_date` 不是
+严格 `YYYY-MM-DD`、发票号为空白或重复、`type` 不是 `receipt` / `reversal`、
+撤回缺少 `reversal_of`、`invoices` / `events` 为空或缺失、`NaN` / `Infinity`
+等）统一返回 `422`，详见下节。
+
 ### 错误（422）
 
 以下情况返回 `422 Unprocessable Entity`：
@@ -794,6 +913,14 @@ docker compose up --build
   非正（≤ 0、`NaN` / `Infinity`）或不是数字、批次号 / 订单号为空白或重复、
   `expiry_date` 不是严格 `YYYY-MM-DD`（如 `2026/01/01`、`2026-02-30`）。
   库存不足不是 422 而是 `409`，整批拒绝且不返回部分分配
+- `/receipt-write-off`：`invoices` / `events` 为空或缺失、应收 / 收款金额
+  非正（≤ 0、`NaN` / `Infinity`）或不是数字、金额**超过两位小数**
+  （如 `0.001`、`10.123`）、发票号 / 事件号 / `reversal_of` 为空白、
+  发票号重复、`due_date` 不是严格 `YYYY-MM-DD`、事件缺少 `type` 或 `type`
+  不是 `receipt` / `reversal`（判别字段）、撤回缺少 `reversal_of`。
+  收款超额、撤回目标不存在或已撤回、相同事件号重放内容不同均不是 422 而是
+  `409`，整批拒绝且不返回部分试算；相同事件号且内容一致的重放是合法幂等
+  重放（事件号允许重复），返回 `200` 且只计一次
 
 ## curl 请求示例
 
@@ -835,6 +962,21 @@ curl -s http://localhost:8000/inventory-allocation \
       {"order_id": "SO-1001", "quantity": 10},
       {"order_id": "SO-1002", "quantity": 5.5}
     ]}'
+
+# /receipt-write-off：R1 收款 20 被撤回并释放，R2 收款 22 结清三张发票
+curl -s http://localhost:8000/receipt-write-off \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "invoices": [
+      {"invoice_no": "INV-003", "due_date": "2026-02-01", "receivable": "10.00"},
+      {"invoice_no": "INV-001", "due_date": "2026-01-01", "receivable": 5},
+      {"invoice_no": "INV-002", "due_date": "2026-01-01", "receivable": 7}
+    ],
+    "events": [
+      {"type": "receipt",  "event_id": "R1", "amount": "20.00"},
+      {"type": "reversal", "event_id": "V1", "reversal_of": "R1"},
+      {"type": "receipt",  "event_id": "R2", "amount": "22.00"}
+    ]}'
 ```
 
 ## 判定原理
@@ -851,6 +993,15 @@ curl -s http://localhost:8000/inventory-allocation \
 则整体判定失败、丢弃全部模拟扣减（不写入、不返回部分结果）。数量全程以
 `Decimal` 运算，避免浮点误差。
 
+收款核销（`/receipt-write-off`）把发票按 `(到期日, 发票号)` 稳定排序后，
+按事件输入顺序维护每张发票的当前未结金额：收款依次取
+`min(剩余收款额, 发票未结)` 填补，且在核销前先断言收款额不超过当时全部未结合计，
+超出即整批失败；撤回不参与重排，只按目标收款记录的原核销明细逐笔加回
+（目标必须是当前生效、未撤回的收款，否则整批失败）。每个事件号首次出现时记录
+内容签名（收款记金额，撤回记 `reversal_of`，类型本身也参与比较），再次出现时
+签名相同则跳过、不同则整批失败。金额全程以 `Decimal` 运算并以 **0.01（分）**
+为最小刻度，整数金额序列化为 JSON 整数、否则序列化为两位以内小数。
+
 ## 本地开发（不用 Docker）
 
 ```bash
@@ -863,10 +1014,11 @@ pytest                               # 运行测试
 
 ```
 app/
-  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route、/inventory-allocation 与 /health
+  main.py        # FastAPI 入口，/expand、/overlaps、/daily-occupancy、/staffing-gaps、/rest-violations、/common-free-slots、/schedule-changes、/handoff-route、/inventory-allocation、/receipt-write-off 与 /health
   models.py      # 请求/响应模型与 422 校验规则
   scheduler.py   # UTC 往返校验分类 + 展开 / 去重 / 排序 + 扫描线重叠检测 + 逐日占用统计 + 在岗缺口扫描 + 休息违规检查 + 共同空闲预约槽枚举 + 排班变更集合差对账 + 共同在岗区间交集与交接链最短路
   inventory.py   # FEFO 批次分配：按 (失效日期, 批次号) 贪心扣减 + 库存不足整批拒绝
+  receivables.py # 收款核销试算：按 (到期日, 发票号) 顺序填补 + 撤回仅释放原核销额 + 幂等重放 + 超额/非法撤回/重放冲突整批拒绝（Decimal 按分精确运算）
 tests/           # pytest 测试（核心逻辑 + API）
 Dockerfile
 docker-compose.yml

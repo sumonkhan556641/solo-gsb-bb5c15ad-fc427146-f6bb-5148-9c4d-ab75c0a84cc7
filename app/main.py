@@ -28,9 +28,15 @@ from .models import (
     HandoffLegOut,
     HandoffRouteRequest,
     HandoffRouteResponse,
+    InvoiceOutstandingOut,
     OrderAllocationOut,
     OverlapRequest,
     OverlapResponse,
+    ReceiptEventIn,
+    ReceiptWriteOffRequest,
+    ReceiptWriteOffResponse,
+    ReceiptWriteOffOut,
+    ReversalEventIn,
     RestViolationOut,
     RestViolationsRequest,
     RestViolationsResponse,
@@ -40,6 +46,13 @@ from .models import (
     StaffingGapOut,
     StaffingGapsRequest,
     StaffingGapsResponse,
+    WriteOffLineOut,
+)
+from .receivables import (
+    Event,
+    InvoiceInput,
+    WriteOffRejected,
+    simulate as simulate_write_off,
 )
 from .scheduler import (
     common_free_slots,
@@ -56,7 +69,7 @@ from .scheduler import (
 
 app = FastAPI(
     title="Civil Schedule Expander",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "基于标准库 zoneinfo 的民用日程展开 API："
         "通过 UTC 往返校验区分正常 / 跳时 / 叠时，"
@@ -67,6 +80,11 @@ app = FastAPI(
         "以及在 UTC 窗口内按步长网格枚举多名参与者共同空闲的预约槽，"
         "并对账同一员工变更前后两版日程在 UTC 窗口内的取消与新增区间，"
         "以及在多名员工的连续共同在岗期间规划消息交接的最早到达链。"
+        "另提供 /inventory-allocation 仓储 FEFO 批次分配，"
+        "以及 /receipt-write-off 收款对发票的按序核销试算："
+        "收款按到期日、发票号顺序填补未结金额、可拆到多张发票，"
+        "撤回仅释放原收款核销额且不重排其他收款，支持幂等重放，"
+        "任何业务冲突均整批拒绝、不返回部分试算。"
     ),
 )
 
@@ -455,4 +473,68 @@ def inventory_allocation(req: AllocateInventoryRequest) -> AllocateInventoryResp
             for row in remaining_rows
         ],
         total_allocated=total_allocated,
+    )
+
+
+@app.post(
+    "/receipt-write-off",
+    response_model=ReceiptWriteOffResponse,
+    summary="按顺序试算收款（含撤回）对发票的核销",
+)
+def receipt_write_off(req: ReceiptWriteOffRequest) -> ReceiptWriteOffResponse | JSONResponse:
+    # 金额用 Decimal 精确运算（按分）；核销顺序、撤回释放与重放幂等
+    # 全部由纯逻辑模块完成，业务冲突整批拒绝（409）不返回部分试算
+    events: list[Event] = []
+    for ev in req.events:
+        if isinstance(ev, ReceiptEventIn):
+            events.append(Event(kind="receipt", event_id=ev.event_id, amount=ev.amount))
+        else:
+            assert isinstance(ev, ReversalEventIn)
+            events.append(
+                Event(
+                    kind="reversal",
+                    event_id=ev.event_id,
+                    reversal_of=ev.reversal_of,
+                )
+            )
+    try:
+        result = simulate_write_off(
+            invoices=[
+                InvoiceInput(
+                    invoice_no=inv.invoice_no,
+                    due_date=date.fromisoformat(inv.due_date),
+                    receivable=inv.receivable,
+                )
+                for inv in req.invoices
+            ],
+            events=events,
+        )
+    except WriteOffRejected as exc:
+        return JSONResponse(status_code=409, content={"detail": exc.detail()})
+    return ReceiptWriteOffResponse(
+        receipts=[
+            ReceiptWriteOffOut(
+                event_id=r.event_id,
+                amount=r.amount,
+                lines=[
+                    WriteOffLineOut(
+                        invoice_no=line.invoice_no,
+                        due_date=line.due_date.isoformat(),
+                        amount=line.amount,
+                    )
+                    for line in r.lines
+                ],
+            )
+            for r in result.receipts
+        ],
+        invoices=[
+            InvoiceOutstandingOut(
+                invoice_no=row.invoice_no,
+                due_date=row.due_date.isoformat(),
+                receivable=row.receivable,
+                outstanding=row.outstanding,
+            )
+            for row in result.invoices
+        ],
+        total_written_off=result.total_written_off,
     )
